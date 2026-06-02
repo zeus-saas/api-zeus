@@ -3,7 +3,7 @@ import 'dotenv/config';
 import express, { Request, Response, NextFunction } from 'express';
 import { initTenantSession, getSession, getAllSessions, loadAllSessionsFromDatabase, generatePairingCode } from './whatsapp/manager';
 import qrcode from 'qrcode';
-import { messageQueue } from './queue/messageQueue';
+import { messageQueue, campaignQueue } from './queue/messageQueue';
 import { apiKeyAuth } from './middleware/auth';
 import { pool, initializeDatabase } from './database';
 import crypto from 'crypto';
@@ -14,7 +14,8 @@ import cors from 'cors';
 
 const app = express();
 app.use(cors({ origin: '*' }));
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // ==========================================
 // FUNÇÕES AUXILIARES & SEGURANÇA MASTER
@@ -386,7 +387,7 @@ Socket Ativo    : ${session?.sock ? 'SIM' : 'NÃO'}
 QR Code na Fila : ${session?.qrCode ? 'SIM' : 'NÃO'}
 
 [AUDITORIA]
-- Este documento certifica a extração dos dados atuais da instância.
+- Este documento certifica a extração dos dados antigos da instância.
 - Em caso de suspensão, o Socket Ativo é desligado automaticamente.
 =====================================================
 FIM DO EXTRATO`;
@@ -644,6 +645,56 @@ app.post('/api/v1/sessions/:tenantId/messages', async (req: Request, res: Respon
         });
     } catch (error: any) {
         res.status(500).json({ error: 'Erro ao enfileirar mensagem', details: error.message });
+    }
+});
+
+// 🔥 NOVA ROTA: DISPARO DE CAMPANHAS EM LOTE (ANTI-BAN COM DELAY INCREMENTAL)
+app.post('/api/v1/sessions/:tenantId/campaigns/batch', async (req: Request, res: Response) => {
+    const { tenantId } = req.params;
+    const { contacts, messages } = req.body;
+
+    // Validação de segurança básica da requisição
+    if (!contacts || !Array.isArray(contacts) || !messages || !Array.isArray(messages)) {
+        return res.status(400).json({ 
+            error: 'Parâmetros inválidos. Certifique-se de enviar os arrays "contacts" e "messages" no corpo da requisição.' 
+        });
+    }
+
+    const session = getSession(tenantId);
+    if (!session || session.status !== 'CONNECTED') {
+        return res.status(400).json({ error: 'Sessão não conectada ou inexistente para este tenant.' });
+    }
+
+    console.log(`[API Lote] Recebida campanha de ${contacts.length} contatos para o Tenant: ${tenantId}`);
+
+    // CONFIGURAÇÃO DO INTERVALO ANTI-BAN CENTRALIZADO
+    const DELAY_ENTRE_CONTATOS_MS = 25000; // 25 segundos entre pessoas diferentes
+
+    try {
+        // Enfileira cada contato de forma independente aplicando o multiplicador de atraso (delay) do BullMQ
+        for (let i = 0; i < contacts.length; i++) {
+            await campaignQueue.add(
+                'send-campaign-job', 
+                {
+                    tenantId,
+                    contact: contacts[i],
+                    messages
+                }, 
+                {
+                    delay: i * DELAY_ENTRE_CONTATOS_MS // Contato 0 envia em 0s, contato 1 em 25s, contato 2 em 50s...
+                }
+            );
+        }
+
+        // Retorna sucesso em milissegundos, liberando o frontend imediatamente
+        return res.json({
+            success: true,
+            message: `Campanha iniciada! ${contacts.length} contatos agendados com sucesso no motor Redis.`
+        });
+
+    } catch (error: any) {
+        console.error(`[API Lote] Falha ao registrar lote no Redis:`, error.message);
+        return res.status(500).json({ error: 'Erro interno ao processar fila de campanhas.', details: error.message });
     }
 });
 

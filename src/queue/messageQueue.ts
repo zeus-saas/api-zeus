@@ -2,7 +2,9 @@ import { Queue, Worker, Job } from 'bullmq';
 import { redisConnection } from './redis';
 import { getSession } from '../whatsapp/manager';
 import { pool } from '../database';
+import { sendCampaignToSingleContact } from '../services/batch-campaign.service';
 
+// Interface para mensagens avulsas (Sua estrutura atual)
 interface MessagePayload {
     tenantId: string;
     number: string;
@@ -18,6 +20,21 @@ interface MessagePayload {
     };
 }
 
+// Interface para Campanhas em Lote (Nova estrutura)
+interface CampaignPayload {
+    tenantId: string;
+    contact: string;
+    messages: Array<{
+        type: 'text' | 'media' | 'audio';
+        content: string;
+        fileName?: string;
+        caption?: string;
+    }>;
+}
+
+// ==========================================
+// 1. FILA E WORKER: MENSAGENS AVULSAS (PADRÃO)
+// ==========================================
 export const messageQueue = new Queue<MessagePayload>('whatsapp-messages', {
     connection: redisConnection,
     defaultJobOptions: {
@@ -97,7 +114,6 @@ const messageWorker = new Worker<MessagePayload>(
             throw err;
         }
 
-        // 🔥 LOG COMPLETO COM ID SESSÃO, DATA/HORA, IP E JID (SALVA NO BANCO)
         if (sentMsg?.key?.id && metadata) {
             try {
                 await pool.query(
@@ -106,7 +122,7 @@ const messageWorker = new Worker<MessagePayload>(
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
                     [
                         tenantId, 
-                        validJid, // Salva o JID atual (futuro-prova)
+                        validJid, 
                         sentMsg.key.id, 
                         'SENT_API', 
                         'SENT', 
@@ -131,4 +147,43 @@ const messageWorker = new Worker<MessagePayload>(
 
 messageWorker.on('failed', (job, err) => {
     console.error(`[Worker] ❌ Falha ao enviar job ${job?.id}:`, err.message);
+});
+
+
+// ==========================================
+// 2. FILA E WORKER: CAMPANHAS EM MASSA (NOVO)
+// ==========================================
+export const campaignQueue = new Queue<CampaignPayload>('whatsapp-campaigns', {
+    connection: redisConnection,
+    defaultJobOptions: {
+        attempts: 3,
+        backoff: {
+            type: 'exponential',
+            delay: 10000, // Espera 10 segundos antes de tentar de novo se o celular desconectar temporariamente
+        },
+        removeOnComplete: true,
+    },
+});
+
+const campaignWorker = new Worker<CampaignPayload>(
+    'whatsapp-campaigns',
+    async (job: Job<CampaignPayload>) => {
+        const { tenantId, contact, messages } = job.data;
+        
+        try {
+            console.log(`[Worker Campanhas] 🚀 Processando contato da fila: ${contact} (Tenant: ${tenantId})`);
+            await sendCampaignToSingleContact(tenantId, contact, messages);
+        } catch (err: any) {
+            console.error(`[Worker Campanhas] ❌ Erro no disparo para ${contact}:`, err.message);
+            throw err;
+        }
+    },
+    {
+        connection: redisConnection,
+        concurrency: 1 // Concorrência 1 garante processamento sequencial estrito por thread da fila
+    }
+);
+
+campaignWorker.on('failed', (job, err) => {
+    console.error(`[Worker Campanhas] ❌ Job de campanha falhou permanentemente para o ID ${job?.id}:`, err.message);
 });
