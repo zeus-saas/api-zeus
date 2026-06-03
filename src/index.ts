@@ -1,7 +1,7 @@
 // @ts-nocheck
 import 'dotenv/config';
 import express, { Request, Response, NextFunction } from 'express';
-import { initTenantSession, getSession, getAllSessions, loadAllSessionsFromDatabase, generatePairingCode } from './whatsapp/manager';
+import { initTenantSession, getSession, getAllSessions, loadAllSessionsFromDatabase, generatePairingCode, validateAndGetJid } from './whatsapp/manager';
 import qrcode from 'qrcode';
 import { messageQueue, campaignQueue } from './queue/messageQueue';
 import { apiKeyAuth } from './middleware/auth';
@@ -150,6 +150,14 @@ const swaggerOptions = {
                     responses: { 200: { description: 'Arquivo .txt gerado' } }
                 }
             },
+            '/api/v1/sessions/{tenantId}/start': {
+                post: {
+                    summary: 'Iniciar Sessão Manualmente (Gerar QR Code)',
+                    tags: ['Sessão e Conexão'],
+                    parameters: [{ in: 'path', name: 'tenantId', required: true, schema: { type: 'string' } }],
+                    responses: { 200: { description: 'Sessão iniciada com sucesso' } }
+                }
+            },
             '/api/v1/sessions/{tenantId}/pairing-code': {
                 post: {
                     summary: 'Solicitar Código PIN',
@@ -168,6 +176,22 @@ const swaggerOptions = {
                         }
                     },
                     responses: { 200: { description: 'Código PIN gerado' } }
+                }
+            },
+            // 🔥 NOVO BOTÃO NO SWAGGER: CONSULTA DE JID
+            '/api/v1/sessions/{tenantId}/check-number/{phoneNumber}': {
+                get: {
+                    summary: 'Consultar JID de um Número (Validação)',
+                    tags: ['Sessão e Conexão'],
+                    description: 'Verifica se o número possui WhatsApp ativo, resolve a questão do 9º dígito e retorna o JID oficial.',
+                    parameters: [
+                        { in: 'path', name: 'tenantId', required: true, schema: { type: 'string' } },
+                        { in: 'path', name: 'phoneNumber', required: true, schema: { type: 'string' }, description: 'Ex: 5541999999999' }
+                    ],
+                    responses: { 
+                        200: { description: 'JID retornado com sucesso' },
+                        400: { description: 'Número inválido ou sem WhatsApp' }
+                    }
                 }
             },
             '/api/v1/sessions/{tenantId}/messages': {
@@ -245,7 +269,6 @@ app.use('/api-docs', (req: Request, res: Response, next: NextFunction) => {
 // ROTAS DE ADMINISTRAÇÃO MASTER (Protegidas)
 // ==========================================
 
-// Criação da coluna de status de forma silenciosa para evitar quebras
 const ensureStatusColumn = async () => {
     try {
         await pool.query('ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT \'ACTIVE\'');
@@ -282,15 +305,9 @@ app.post('/api/v1/admin/tenants', masterKeyAuth, async (req: Request, res: Respo
             [tenantId, newApiKey]
         );
 
-        try {
-            await initTenantSession(tenantId);
-        } catch (initError) {
-            console.log(`[Aviso] Sessão criada: ${tenantId}`);
-        }
-
         res.json({
             success: true,
-            message: `Instância para o tenant '${tenantId}' criada com sucesso!`,
+            message: `Instância para o tenant '${tenantId}' criada com sucesso! Você pode inicializá-la agora.`,
             tenantId: tenantId,
             apiKey: newApiKey
         });
@@ -299,7 +316,6 @@ app.post('/api/v1/admin/tenants', masterKeyAuth, async (req: Request, res: Respo
     }
 });
 
-// 1. Função de exclusão de instância
 app.delete('/api/v1/admin/tenants/:tenantId', masterKeyAuth, async (req: Request, res: Response) => {
     const { tenantId } = req.params;
     
@@ -310,7 +326,6 @@ app.delete('/api/v1/admin/tenants/:tenantId', masterKeyAuth, async (req: Request
             return res.status(404).json({ error: 'Instância não encontrada no banco de dados.' });
         }
 
-        // Derruba a sessão atual
         const session = getSession(tenantId);
         if (session?.sock) {
             await session.sock.logout();
@@ -322,7 +337,6 @@ app.delete('/api/v1/admin/tenants/:tenantId', masterKeyAuth, async (req: Request
     }
 });
 
-// 2. Suspensão de Instância
 app.post('/api/v1/admin/tenants/:tenantId/suspend', masterKeyAuth, async (req: Request, res: Response) => {
     const { tenantId } = req.params;
     const { action } = req.body; 
@@ -341,7 +355,6 @@ app.post('/api/v1/admin/tenants/:tenantId/suspend', masterKeyAuth, async (req: R
             return res.status(404).json({ error: 'Instância não encontrada.' });
         }
 
-        // Se suspender, mata a conexão imediatamente
         if (newStatus === 'SUSPENDED') {
             const session = getSession(tenantId);
             if (session?.sock) {
@@ -355,7 +368,6 @@ app.post('/api/v1/admin/tenants/:tenantId/suspend', masterKeyAuth, async (req: R
     }
 });
 
-// 3. Extrato de log completo em .txt
 app.get('/api/v1/admin/tenants/:tenantId/logs', masterKeyAuth, async (req: Request, res: Response) => {
     const { tenantId } = req.params;
 
@@ -401,12 +413,30 @@ FIM DO EXTRATO`;
 });
 
 // 🔒 Aplica o middleware global de segurança para as rotas padrão (clientes)
-// Ele é posicionado AQUI para não bloquear as rotas master declaradas acima
 app.use('/api/v1', apiKeyAuth);
 
 // ==========================================
 // ROTAS PADRÃO (CLIENTES / TENANTS)
 // ==========================================
+
+app.post('/api/v1/sessions/:tenantId/start', async (req: Request, res: Response) => {
+    const { tenantId } = req.params;
+    
+    try {
+        const check = await pool.query('SELECT status FROM api_keys WHERE tenant_id = $1', [tenantId]);
+        if (check.rowCount > 0 && check.rows[0].status === 'SUSPENDED') {
+            return res.status(403).json({ error: 'Conta suspensa. Regularize para usar o serviço.' });
+        }
+
+        let session = getSession(tenantId);
+        if (!session) {
+            await initTenantSession(tenantId);
+        }
+        res.json({ success: true, message: 'Processo de conexão iniciado com sucesso. Aguardando QR Code.' });
+    } catch (error: any) {
+        res.status(500).json({ error: 'Erro ao iniciar a sessão manualmente.', details: error.message });
+    }
+});
 
 app.post('/api/v1/sessions/:tenantId/pairing-code', async (req: Request, res: Response) => {
     const { tenantId } = req.params;
@@ -417,7 +447,6 @@ app.post('/api/v1/sessions/:tenantId/pairing-code', async (req: Request, res: Re
     }
 
     try {
-        // Valida se o cliente não está suspenso antes de iniciar
         const check = await pool.query('SELECT status FROM api_keys WHERE tenant_id = $1', [tenantId]);
         if (check.rowCount > 0 && check.rows[0].status === 'SUSPENDED') {
             return res.status(403).json({ error: 'Conta suspensa. Regularize para usar o serviço.' });
@@ -436,16 +465,58 @@ app.post('/api/v1/sessions/:tenantId/pairing-code', async (req: Request, res: Re
     }
 });
 
+// 🔥 NOVA ROTA DA API: CONSULTA DE JID E VALIDAÇÃO DE NÚMERO
+app.get('/api/v1/sessions/:tenantId/check-number/:phoneNumber', async (req: Request, res: Response) => {
+    const { tenantId, phoneNumber } = req.params;
+
+    try {
+        const session = getSession(tenantId);
+        if (!session || session.status !== 'CONNECTED') {
+            return res.status(400).json({ error: 'Sessão não conectada ou inexistente para este tenant. Conecte o WhatsApp primeiro.' });
+        }
+
+        // Usa o motor inteligente para validar o número na Meta e/ou Banco de Dados
+        const jid = await validateAndGetJid(tenantId, phoneNumber);
+        
+        res.json({ 
+            success: true, 
+            message: 'Número validado com sucesso.',
+            originalNumber: phoneNumber,
+            jid: jid
+        });
+    } catch (error: any) {
+        res.status(400).json({ error: error.message || 'Erro ao validar o número.' });
+    }
+});
+
 app.get('/api/v1/sessions/:tenantId', async (req: Request, res: Response) => {
     const { tenantId } = req.params;
     const authToken = req.headers.authorization || '';
     
     let session = getSession(tenantId);
 
-    if (!session) {
-        await initTenantSession(tenantId);
-        await new Promise(resolve => setTimeout(resolve, 1500));
-        session = getSession(tenantId);
+    if (session?.status === 'CONNECTED') {
+        const htmlConnected = `
+            <!DOCTYPE html>
+            <html lang="pt-BR">
+            <head>
+                <meta charset="UTF-8">
+                <title>Conectado - ${tenantId}</title>
+                <style>
+                    body { display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #0f172a; color: #f8fafc; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+                    .card { background: #1e293b; padding: 40px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0, 255, 128, 0.1); text-align: center; border: 2px solid #22c55e; }
+                    h2 { margin-top: 0; color: #22c55e; }
+                </style>
+            </head>
+            <body>
+                <div class="card">
+                    <h2>✅ Conexão Estabelecida</h2>
+                    <p>O número para <strong>${tenantId}</strong> está autenticado e pronto para disparos.</p>
+                </div>
+            </body>
+            </html>
+        `;
+        return res.send(htmlConnected);
     }
 
     if (session?.status === 'WAITING_QR' && session.qrCode) {
@@ -581,31 +652,71 @@ app.get('/api/v1/sessions/:tenantId', async (req: Request, res: Response) => {
         return res.send(html);
     }
 
-    if (session?.status === 'CONNECTED') {
-        const htmlConnected = `
-            <!DOCTYPE html>
-            <html lang="pt-BR">
-            <head>
-                <meta charset="UTF-8">
-                <title>Conectado - ${tenantId}</title>
-                <style>
-                    body { display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #0f172a; color: #f8fafc; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-                    .card { background: #1e293b; padding: 40px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0, 255, 128, 0.1); text-align: center; border: 2px solid #22c55e; }
-                    h2 { margin-top: 0; color: #22c55e; }
-                </style>
-            </head>
-            <body>
-                <div class="card">
-                    <h2>✅ Conexão Estabelecida</h2>
-                    <p>O número para <strong>${tenantId}</strong> está autenticado e pronto para disparos.</p>
-                </div>
-            </body>
-            </html>
-        `;
-        return res.send(htmlConnected);
-    }
+    const isInitializing = session?.status === 'INITIALIZING';
+    const htmlStart = `
+        <!DOCTYPE html>
+        <html lang="pt-BR">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Iniciar Sessão - ${tenantId}</title>
+            <style>
+                body { display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; margin: 0; background-color: #0f172a; color: #f8fafc; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+                .card { background: #1e293b; padding: 30px; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); text-align: center; border: 1px solid #334155; width: 340px; }
+                h2 { margin-top: 0; color: #38bdf8; font-size: 1.5rem;}
+                p { color: #cbd5e1; font-size: 0.95rem; margin-bottom: 25px; line-height: 1.5; }
+                button.btn { width: 100%; background: #38bdf8; color: #0f172a; border: none; padding: 14px; border-radius: 8px; font-weight: bold; font-size: 1rem; cursor: pointer; transition: 0.2s; }
+                button.btn:hover { background: #0ea5e9; }
+                button.btn:disabled { background: #475569; cursor: not-allowed; color: #94a3b8; }
+            </style>
+        </head>
+        <body>
+            <div class="card">
+                <h2>Iniciar Dispositivo</h2>
+                <p>A sessão do WhatsApp ainda não foi iniciada em nosso servidor. Clique no botão abaixo para ligar a sessão e gerar o QR Code ou solicitar o PIN.</p>
+                <button id="start-btn" class="btn" onclick="startSession()" ${isInitializing ? 'disabled' : ''}>
+                    ${isInitializing ? 'Iniciando Sessão...' : 'Ligar Sessão / Gerar QR Code'}
+                </button>
+            </div>
 
-    res.json({ status: session?.status || 'UNKNOWN' });
+            <script>
+                const authToken = "${authToken}";
+                async function startSession() {
+                    const btn = document.getElementById('start-btn');
+                    btn.innerText = 'Iniciando Sessão...';
+                    btn.disabled = true;
+
+                    try {
+                        const response = await fetch(\`/api/v1/sessions/${tenantId}/start\`, {
+                            method: 'POST',
+                            headers: {
+                                'Authorization': authToken,
+                                'Content-Type': 'application/json'
+                            }
+                        });
+                        
+                        const data = await response.json();
+                        if (data.success) {
+                            setTimeout(() => window.location.reload(), 2500);
+                        } else {
+                            alert('Erro: ' + (data.error || 'Falha ao iniciar.'));
+                            btn.innerText = 'Ligar Sessão / Gerar QR Code';
+                            btn.disabled = false;
+                        }
+                    } catch (err) {
+                        alert('Erro de comunicação com o servidor.');
+                        btn.innerText = 'Ligar Sessão / Gerar QR Code';
+                        btn.disabled = false;
+                    }
+                }
+
+                ${isInitializing ? 'setTimeout(() => window.location.reload(), 3000);' : ''}
+            </script>
+        </body>
+        </html>
+    `;
+    
+    return res.send(htmlStart);
 });
 
 app.post('/api/v1/sessions/:tenantId/messages', async (req: Request, res: Response) => {
@@ -648,12 +759,10 @@ app.post('/api/v1/sessions/:tenantId/messages', async (req: Request, res: Respon
     }
 });
 
-// 🔥 NOVA ROTA: DISPARO DE CAMPANHAS EM LOTE (ANTI-BAN COM DELAY INCREMENTAL)
 app.post('/api/v1/sessions/:tenantId/campaigns/batch', async (req: Request, res: Response) => {
     const { tenantId } = req.params;
     const { contacts, messages } = req.body;
 
-    // Validação de segurança básica da requisição
     if (!contacts || !Array.isArray(contacts) || !messages || !Array.isArray(messages)) {
         return res.status(400).json({ 
             error: 'Parâmetros inválidos. Certifique-se de enviar os arrays "contacts" e "messages" no corpo da requisição.' 
@@ -666,12 +775,9 @@ app.post('/api/v1/sessions/:tenantId/campaigns/batch', async (req: Request, res:
     }
 
     console.log(`[API Lote] Recebida campanha de ${contacts.length} contatos para o Tenant: ${tenantId}`);
-
-    // CONFIGURAÇÃO DO INTERVALO ANTI-BAN CENTRALIZADO
-    const DELAY_ENTRE_CONTATOS_MS = 25000; // 25 segundos entre pessoas diferentes
+    const DELAY_ENTRE_CONTATOS_MS = 25000; 
 
     try {
-        // Enfileira cada contato de forma independente aplicando o multiplicador de atraso (delay) do BullMQ
         for (let i = 0; i < contacts.length; i++) {
             await campaignQueue.add(
                 'send-campaign-job', 
@@ -681,12 +787,11 @@ app.post('/api/v1/sessions/:tenantId/campaigns/batch', async (req: Request, res:
                     messages
                 }, 
                 {
-                    delay: i * DELAY_ENTRE_CONTATOS_MS // Contato 0 envia em 0s, contato 1 em 25s, contato 2 em 50s...
+                    delay: i * DELAY_ENTRE_CONTATOS_MS 
                 }
             );
         }
 
-        // Retorna sucesso em milissegundos, liberando o frontend imediatamente
         return res.json({
             success: true,
             message: `Campanha iniciada! ${contacts.length} contatos agendados com sucesso no motor Redis.`
@@ -714,7 +819,7 @@ app.get('/api/v1/sessions', async (req: Request, res: Response) => {
     try {
         const sessions = getAllSessions(); 
         
-        await ensureStatusColumn(); // Segurança caso rode num BD novo
+        await ensureStatusColumn(); 
         const { rows } = await pool.query('SELECT tenant_id, api_key, status FROM api_keys');
         
         const result = rows.map(dbRow => {

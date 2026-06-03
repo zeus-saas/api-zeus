@@ -6,6 +6,7 @@ import { pool } from '../database';
 import { usePostgresAuthState } from './postgresAuth';
 
 const sessions = new Map<string, any>();
+const reconnectAttemptsMap = new Map<string, number>(); // MAPA PARA RASTREAR TENTATIVAS DE RECONEXÃO
 const logger = pino({ level: 'silent' });
 
 const WEBHOOK_URL = process.env.WEBHOOK_URL || 'http://localhost:3333/api/webhook'; 
@@ -61,14 +62,29 @@ export const initTenantSession = async (tenantId: string) => {
             sock.end(undefined);
 
             if (shouldReconnect) {
-                setTimeout(() => initTenantSession(tenantId), 5000); // Aumentado para 5s para evitar rate limit
+                // INCREMENTA O CONTADOR DE TENTATIVAS DE RECONEXÃO
+                let attempts = reconnectAttemptsMap.get(tenantId) || 0;
+                attempts++;
+                reconnectAttemptsMap.set(tenantId, attempts);
+
+                if (attempts >= 5) {
+                    console.log(`[${tenantId}] ❌ Excesso de tentativas de reconexão (${attempts}). Desconectando forçadamente para evitar bloqueios e sobrecarga.`);
+                    await removeCreds();
+                    sessions.delete(tenantId);
+                    reconnectAttemptsMap.delete(tenantId);
+                } else {
+                    console.log(`[${tenantId}] 🔄 Tentativa de reconexão ${attempts}/5 em 5 segundos...`);
+                    setTimeout(() => initTenantSession(tenantId), 5000); // Tenta novamente
+                }
             } else {
                 await removeCreds();
                 sessions.delete(tenantId);
-                console.log(`[${tenantId}] Sessão encerrada e dados apagados do PostgreSQL.`);
+                reconnectAttemptsMap.delete(tenantId);
+                console.log(`[${tenantId}] Sessão encerrada (Logged Out) e dados apagados do PostgreSQL.`);
             }
         } else if (connection === 'open') {
             console.log(`[${tenantId}] Conectado com sucesso!`);
+            reconnectAttemptsMap.delete(tenantId); // Reseta o contador de tentativas de erro ao obter sucesso
             sessions.set(tenantId, { sock, status: 'CONNECTED', qrCode: null });
         }
     });
@@ -235,4 +251,59 @@ export const generatePairingCode = async (tenantId: string, phoneNumber: string)
     await new Promise(resolve => setTimeout(resolve, 1500));
     const code = await session.sock.requestPairingCode(cleanNumber);
     return code;
+};
+
+// 🔥 NOVO MOTOR DE INTELIGÊNCIA: RESOLUÇÃO DE JID E 9º DÍGITO COM CACHE NO BANCO
+export const validateAndGetJid = async (tenantId: string, phoneNumber: string): Promise<string> => {
+    const session = sessions.get(tenantId);
+    if (!session || !session.sock) throw new Error('Sessão não conectada');
+
+    let cleanNumber = phoneNumber.replace(/\D/g, '');
+    if (!cleanNumber.startsWith('55')) cleanNumber = '55' + cleanNumber;
+
+    // 1. Verifica cache no banco de dados para extrema velocidade (evita bater na Meta à toa)
+    try {
+        const dbCheck = await pool.query('SELECT wa_jid FROM contacts WHERE tenant_id = $1 AND original_number = $2', [tenantId, cleanNumber]);
+        if (dbCheck.rowCount !== null && dbCheck.rowCount > 0) return dbCheck.rows[0].wa_jid;
+    } catch (err) {
+        // Se a tabela ainda não estiver pronta, ignora silenciosamente
+    }
+
+    // 2. Tenta o número exatamente como o usuário digitou
+    let [result] = await session.sock.onWhatsApp(cleanNumber);
+
+    // 3. Estratégia do 9º Dígito (Específico para Brasil - DDI 55)
+    if ((!result || !result.exists) && cleanNumber.startsWith('55')) {
+        const ddd = cleanNumber.substring(2, 4);
+        const numberPart = cleanNumber.substring(4);
+        
+        if (numberPart.length === 9 && numberPart.startsWith('9')) {
+            // Se tem 9, testa sem o 9
+            const semNove = `55${ddd}${numberPart.substring(1)}`;
+            const [resSemNove] = await session.sock.onWhatsApp(semNove);
+            result = resSemNove;
+        } else if (numberPart.length === 8) {
+            // Se não tem 9, testa colocando o 9
+            const comNove = `55${ddd}9${numberPart}`;
+            const [resComNove] = await session.sock.onWhatsApp(comNove);
+            result = resComNove;
+        }
+    }
+
+    // 4. Se encontrou, salva a identidade verdadeira no banco
+    if (result && result.exists) {
+        try {
+            await pool.query(
+                `INSERT INTO contacts (tenant_id, original_number, wa_jid) VALUES ($1, $2, $3)
+                 ON CONFLICT (tenant_id, original_number) DO UPDATE SET wa_jid = EXCLUDED.wa_jid`,
+                [tenantId, cleanNumber, result.jid]
+            );
+            console.log(`[Contato Verificado] ${cleanNumber} vinculado ao JID Real: ${result.jid}`);
+        } catch (dbErr) {
+            console.error('[Motor AWS] Erro ao gravar JID no cache:', dbErr);
+        }
+        return result.jid;
+    }
+
+    throw new Error(`Número ${cleanNumber} não possui WhatsApp ativo (ou o número não existe).`);
 };

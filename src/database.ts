@@ -23,7 +23,7 @@ export const initializeDatabase = async () => {
             );
         `);
 
-        // 🔥 NOVA TABELA: Log Perpétuo de Mensagens
+        // 🔥 Tabela: Log Perpétuo de Mensagens
         await pool.query(`
             CREATE TABLE IF NOT EXISTS messages_log (
                 id SERIAL PRIMARY KEY,
@@ -45,6 +45,19 @@ export const initializeDatabase = async () => {
                 UNIQUE(tenant_id, message_id)
             );
         `);
+
+        // 🔥 NOVA TABELA: Cache de Contatos Inteligente (JID)
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS contacts (
+                id SERIAL PRIMARY KEY,
+                tenant_id VARCHAR(255) NOT NULL,
+                original_number VARCHAR(50) NOT NULL,
+                wa_jid VARCHAR(255) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(tenant_id, original_number)
+            );
+        `);
+
         console.log('📦 Banco de dados e tabelas de log inicializados com sucesso.');
     } catch (error: any) {
         console.error('❌ Erro ao inicializar o banco de dados:', error.message);

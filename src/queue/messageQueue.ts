@@ -1,6 +1,6 @@
 import { Queue, Worker, Job } from 'bullmq';
 import { redisConnection } from './redis';
-import { getSession } from '../whatsapp/manager';
+import { getSession, validateAndGetJid } from '../whatsapp/manager';
 import { pool } from '../database';
 import { sendCampaignToSingleContact } from '../services/batch-campaign.service';
 
@@ -47,44 +47,18 @@ export const messageQueue = new Queue<MessagePayload>('whatsapp-messages', {
     },
 });
 
-const getValidJid = async (sock: any, rawNumber: string): Promise<string | null> => {
-    let [result] = await sock.onWhatsApp(rawNumber);
-    if (result?.exists) return result.jid;
-
-    if (rawNumber.startsWith('55') && (rawNumber.length === 12 || rawNumber.length === 13)) {
-        const ddd = rawNumber.substring(2, 4);
-        const numeroLocal = rawNumber.substring(4);
-        
-        let variacao = '';
-        
-        if (numeroLocal.length === 9) {
-            variacao = `55${ddd}${numeroLocal.substring(1)}`;
-        } else if (numeroLocal.length === 8) {
-            variacao = `55${ddd}9${numeroLocal}`;
-        }
-
-        if (variacao) {
-            let [resultVariacao] = await sock.onWhatsApp(variacao);
-            if (resultVariacao?.exists) {
-                console.log(`[Worker] Auto-Correção de Nono Dígito: ${rawNumber} -> ${variacao}`);
-                return resultVariacao.jid;
-            }
-        }
-    }
-    return null;
-};
-
 const messageWorker = new Worker<MessagePayload>(
     'whatsapp-messages',
     async (job: Job<MessagePayload>) => {
         const { tenantId, number, text, mediaUrl, mediaType, mimetype, metadata } = job.data;
         const session = getSession(tenantId);
 
-        if (!session || session.status !== 'CONNECTED') {
+        if (!session || session.status !== 'CONNECTED' || !session.sock) {
             throw new Error(`Sessão do tenant ${tenantId} não está conectada.`);
         }
 
-        const validJid = await getValidJid(session.sock, number);
+        // 🔥 O WORKER AGORA CHAMA O VERIFICADOR INTELIGENTE (CACHED)
+        const validJid = await validateAndGetJid(tenantId, number);
         
         if (!validJid) {
             console.error(`[Worker] ❌ Abortado: O número ${number} não possui WhatsApp ativo (Tenant: ${tenantId})`);
