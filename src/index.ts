@@ -89,8 +89,7 @@ const swaggerOptions = {
             description: 'Painel unificado para manutenção, testes rápidos e gerenciamento de instâncias multitenant.',
         },
         servers: [
-            { url: 'http://3.144.93.205:3000', description: 'Servidor AWS (Produção)' },
-            { url: 'http://localhost:3000', description: 'Servidor Local / Desenvolvimento' }
+            { url: '/', description: 'Servidor Atual (Auto-detectado)' }
         ],
         components: {
             securitySchemes: {
