@@ -1,7 +1,11 @@
 import { Request, Response, NextFunction } from 'express';
 import { pool } from '../database';
+import jwt from 'jsonwebtoken';
 import 'dotenv/config';
 
+// ==========================================
+// 1. AUTENTICAÇÃO DO MOTOR WHATSAPP (API KEY / MASTER KEY)
+// ==========================================
 export const apiKeyAuth = async (req: Request, res: Response, next: NextFunction) => {
     const authHeader = req.headers.authorization;
     if (!authHeader) return res.status(401).json({ error: 'Token não fornecido' });
@@ -37,5 +41,41 @@ export const apiKeyAuth = async (req: Request, res: Response, next: NextFunction
         next();
     } catch (e) {
         res.status(500).json({ error: 'Erro no auth' });
+    }
+};
+
+// ==========================================
+// 2. AUTENTICAÇÃO DO PAINEL SAAS (JWT TOKEN)
+// ==========================================
+const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_zeus_key_2026';
+
+// Estende a interface do Request do Express para aceitar os dados do Usuário Logado
+export interface AuthRequest extends Request {
+    user?: {
+        userId: string;
+        companyId: string;
+        role: string;
+    };
+}
+
+export const saasAuthMiddleware = (req: AuthRequest, res: Response, next: NextFunction) => {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'Token de autenticação ausente ou inválido.' });
+    }
+
+    const token = authHeader.split(' ')[1];
+
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET) as any;
+        req.user = {
+            userId: decoded.userId,
+            companyId: decoded.companyId,
+            role: decoded.role
+        };
+        next();
+    } catch (error) {
+        return res.status(401).json({ error: 'Token expirado ou inválido.' });
     }
 };

@@ -1,18 +1,23 @@
-import { Redis } from 'ioredis';
+import Redis, { RedisOptions } from 'ioredis';
+import 'dotenv/config';
 
-// Se estiver no Docker, usará a variável de ambiente. Senão, usa o localhost.
-const REDIS_HOST = process.env.REDIS_HOST || '127.0.0.1';
-
-export const redisConnection = new Redis({
-    host: REDIS_HOST,
-    port: 6379,
+const redisConfig: RedisOptions = {
+    host: process.env.REDIS_HOST || 'whatsapp_redis',
+    port: Number(process.env.REDIS_PORT) || 6379,
     maxRetriesPerRequest: null,
-});
+    enableReadyCheck: false,
+    retryStrategy: (times: number) => Math.min(times * 50, 2000)
+};
+
+const redisUrl = process.env.REDIS_URL;
+
+// TypeScript agora entende claramente a separação entre string e objeto
+export const redisConnection = redisUrl ? new Redis(redisUrl) : new Redis(redisConfig);
 
 redisConnection.on('connect', () => {
-    console.log(`🔴 Conectado ao Redis em ${REDIS_HOST}`);
+    console.log(`✅ [Redis] Conectado com sucesso em ${process.env.REDIS_HOST || 'whatsapp_redis'}`);
 });
 
 redisConnection.on('error', (err) => {
-    console.error('❌ Erro no Redis:', err);
+    console.error('❌ [Redis] Erro crítico:', err.message);
 });

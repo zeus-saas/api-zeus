@@ -14,7 +14,7 @@ services:
     image: redis:7-alpine
     container_name: whatsapp_redis
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes"] # Habilita persistência de dados
+    command: ["redis-server", "--appendonly", "yes"]
 
   whatsapp_api_node:
     build: .
@@ -28,7 +28,7 @@ services:
       - REDIS_HOST=whatsapp_redis
       - PORT=3000
     ports:
-      - "3000:3000"
+      - "49823:3000" # Porta aleatória aplicada
 
 volumes:
   aw_pgdata:
